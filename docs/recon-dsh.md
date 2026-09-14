@@ -165,26 +165,33 @@ $DSH_HOME/
 | `npx @deepseek-ai/dsh` 首次下载 **约 292MB**(`~/.npm/_npx` 总计 808MB,实测) | **不能把 npx 作为默认路径**;必须内置运行时或明确的首次下载引导 |
 | 官方标注 **developer preview,会有不兼容改动** | 协议与配置格式需要版本适配层 / 钉版本 |
 | 本机 `~/.dsh` **整个目录属于 root**(`settings.yaml` 为 `600 root`) | 普通用户 `chen` 无法写入 → `dsh web` 报 `EACCES ... profiles/web/package.json`。**客户端必须检测并给出修复引导**,否则任何 dsh 使用都会失败 |
+| `dsh` 是**三层进程树**(`npx` → `npm exec` → `node .../.bin/dsh`) | 只杀直接子进程会把真正的服务留下变孤儿(实测)。必须 `setpgid` 自成进程组 + 按组发信号 |
+| 应用被强杀时,退出钩子不执行 | 子进程组会残留并占端口 → 需要 pidfile + 下次启动前的残留清理 |
+| Finder 启动的 GUI 应用只拿到 `/usr/bin:/bin:/usr/sbin:/sbin` | `dsh`/`npx` 都是 `#!/usr/bin/env node`,子进程会因找不到 `node` 而死 → 必须补全 `PATH` |
 
 ---
 
 ## 8. 对 DHDesktop 的架构结论
 
-**第一阶段(P1)**:Rust 托管 `dsh web --no-open`,解析 stdout 那行拿到端口+token,Tauri 主窗口加载该 URL。
-→ 用户「打开就能用」,且**完全不依赖 RPC 协议**。
+**第一阶段(P1)** — ✅ 已实现:Rust 托管 `dsh web --no-open --port 0`,解析 stdout 那行拿到端口 + token,
+Tauri 主窗口导航到该 URL。用户「打开就能用」,且**完全不依赖 RPC 协议**。
 
-**第二阶段(P2)**:插件管理 = 独立窗口 + Rust 命令:读 `package.json` 的 `dsh.profile.bundles` / `dependencies`,调 `dsh plugin --profile dhdesktop add|remove`,写 `cordis.patch.yml` 做禁用,改完重启后端。
-→ 同样**不依赖 RPC 协议**,是你明确要的功能。
+**第二阶段(P2)** — 待做:插件管理 = 独立窗口 + Rust 命令:读 `package.json` 的
+`dsh.profile.bundles` / `dependencies`,调 `dsh plugin --profile dhdesktop add|remove`,
+写 `cordis.patch.yml` 做禁用,改完重启后端。同样**不依赖 RPC 协议**。
 
-**第三阶段(P3)**:是否用自研 Vue UI 替换官方 Web UI。若做,必须让 **Rust 当代理**(Origin + cookie),或使用 ACP/SDK 入口 —— 待补(见第 9 节)。
+**第三阶段(P3)** — 待定:是否用自研 Vue UI 替换官方 Web UI。若做,必须让 **Rust 当代理**
+(自己设 `Origin` + 持 cookie),或改走 ACP/SDK 入口(见第 9 节)。
 
-**profile 归属**:DHDesktop 使用自己的 profile(`dhdesktop`,由 `--from-default-profile web` 初始化),与用户 CLI 的 `web` profile 隔离,理由同官方:「共享可执行依赖图会让两者相互改变版本」。
+**profile 归属**:DHDesktop 使用自己的 profile(`dhdesktop`,由 `--from-default-profile web` 初始化),
+与用户 CLI 的 `web` profile 隔离,理由同官方:「共享可执行依赖图会让两者相互改变版本」。
 
 ---
 
 ## 9. 待补
 
 - [ ] `dsh-acp-app` / `dsh-sdk-*` 两条路径的定位与稳定性评估(能否作为第三方自研 UI 的正式入口)
-- [ ] `dsh plugin` 对各包操作(enable/disable/remove)的精确语义
+- [ ] `dsh plugin` 对各包操作(enable/disable/remove)的精确语义 —— P2 开工前必须先验证
 - [ ] `--trusted-host` 是否接受 `tauri://localhost` 这类非 http scheme
-- [ ] `dsh web` 的端口占用/崩溃/重启行为
+- [x] `dsh web` 的端口策略:`--port 0` 由系统挑端口,实际端口写在就绪行里(实测)
+- [x] 崩溃/强杀后的残留行为:进程组会残留,已用 pidfile + 启动前清理兜住(实测)

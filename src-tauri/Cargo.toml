@@ -22,6 +22,12 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# dsh 后端进程的异步托管
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt"] }
+# 解析 `dsh web` 打出的就绪行里的 URL / token
+url = "2"
+# 向子进程发 SIGTERM(优雅退出)
+libc = "0.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
