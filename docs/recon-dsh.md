@@ -155,6 +155,30 @@ $DSH_HOME/
 
 **DHDesktop 的插件管理因此不需要任何 RPC 协议** —— 就是「读配置文件 + 跑 pnpm + 重启后端」,这是第 8 节把它排在自研 UI 之前的原因。
 
+### 6.1 官方桌面端的安装流程(源码侦察)
+
+来源:`apps/desktop/src/project-manager.ts:378-391`、`apps/desktop/renderer/plugin-manager.js:77-85`
+
+```
+点「安装」→ pnpm add <spec> --save-exact --ignore-scripts
+          → 读新包 package.json,校验它声明了 dsh.bundle.patch
+            (不声明就报错 —— 所以不能随便装一个 npm 包当插件)
+          → 把包名追加到 dsh.profile.bundles
+```
+
+| 操作 | 机制 | 需重启 |
+| --- | --- | --- |
+| 启用 | 包名加入 `dsh.profile.bundles` | 是 |
+| 禁用 | 从 `dsh.profile.bundles` 移除 | 是 |
+| 卸载 | `pnpm remove` + 从 `dependencies` 与 `bundles` 都删 | 是 |
+
+**关键结论**:不要自己重写 pnpm + 清单同步逻辑。`dsh plugin --profile <名> add|remove|update <包>`
+内部就是「pnpm 薄包装 + `reconcilePlugins()` 自动同步 bundles 数组」(`apps/cli/src/plugin.ts:127-165`),
+直接调它比自己拼更稳。
+
+插件包必须在自己的 `package.json` 里声明 `dsh.bundle.patch`,指向一个 Cordis 配置片段 YAML;
+启动时按 `bundles` 顺序依次加载这些片段。
+
 ---
 
 ## 7. 硬约束与环境坑
@@ -188,10 +212,39 @@ Tauri 主窗口导航到该 URL。用户「打开就能用」,且**完全不依�
 
 ---
 
-## 9. 待补
+## 9. 三条集成路径的最终结论(源码侦察)
 
-- [ ] `dsh-acp-app` / `dsh-sdk-*` 两条路径的定位与稳定性评估(能否作为第三方自研 UI 的正式入口)
-- [ ] `dsh plugin` 对各包操作(enable/disable/remove)的精确语义 —— P2 开工前必须先验证
-- [ ] `--trusted-host` 是否接受 `tauri://localhost` 这类非 http scheme
+| 路径 | 传输 | 官方定位 | 对第三方 GUI 的结论 |
+| --- | --- | --- | --- |
+| **A. API Gateway** | WebSocket `/api/remote.mux` + HTTP `POST /api/<ns>/<method>` | 官方 Web UI 的正式接口 | ✅ **唯一官方认可的 GUI 路径**(官方 Web UI 就是这么做的) |
+| B. SDK | 换行分帧的 JSON-RPC over stdio | 「面向以子进程方式启动 Harness 的外部程序」 | ⚠️ 可行但非设计目标;适合程序式集成,不适合 GUI |
+| C. ACP | JSON-RPC over stdio | 「**仅面向自动化**的服务器」 | ❌ 官方明确不把 GUI 列入支持范围 |
+| Desktop 分帧管道 | 私有协议 | 官方 Electron 桌面端 | ❌ 无公开规范,第三方无法实现 |
+
+**路径 A 的流式协议形状**(来源:`packages/api/gateway/src/stream-protocol.ts:260-290`):
+
+```ts
+// 客户端 → 服务端
+{ type: 'open' | 'cancel', streamId, endpoint, payload }
+// 服务端 → 客户端
+{ type: 'item' | 'error' | 'end', streamId, value? }
+```
+
+### 自研 UI 的硬前提
+
+路径 A 要做自研 UI,必须由 **Rust 做正向代理**,前端不能直连:
+
+1. HTTP:注入 loopback 的 `Host` / `Origin`(围栏按这两者校验),带上签名 cookie;
+2. WebSocket:先做一次 HTTP 握手拿到 cookie,再用 `Cookie` 头转发 upgrade;
+3. 原因见第 5 节实测:cookie 是 `SameSite=Strict; HttpOnly`,跨源一律 403。
+
+这也是官方 Electron 端宁可用私有管道也不用端口的原因。
+
+## 10. 待补
+
+- [x] ACP / SDK 两条路径的定位与稳定性评估 → 见第 9 节
+- [x] `dsh plugin` 的精确语义 → 见第 6.1 节
+- [ ] `--trusted-host` 是否接受 `tauri://localhost` 这类非 http scheme(若要做自研 UI 则需验证)
 - [x] `dsh web` 的端口策略:`--port 0` 由系统挑端口,实际端口写在就绪行里(实测)
 - [x] 崩溃/强杀后的残留行为:进程组会残留,已用 pidfile + 启动前清理兜住(实测)
+- [x] Finder 双击启动(极窄 PATH)能否工作:已用 `env -i` 模拟验证通过
