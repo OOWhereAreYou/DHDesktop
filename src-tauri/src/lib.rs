@@ -199,6 +199,18 @@ pub fn run() {
             plugin_snapshot,
             reveal_in_finder,
         ])
+        // 统一策略:**关窗 = 隐藏,永不销毁**。
+        //
+        // 曾经的行为是让窗口被销毁,于是“再打开”必须重建同 label 的窗口,
+        // 而 dsh 窗口重建还要重做一次鉴权 —— 途中任何一环失败,用户看到的就是
+        // “关掉之后再也打不开”,而且错误信息还打在隐藏着的状态页里,完全看不到。
+        // 隐藏/显示就没有这类失败模式:窗口对象一直在,重开只是 show()。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
