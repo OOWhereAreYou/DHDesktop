@@ -56,6 +56,12 @@ async fn open_dsh_ui(state: tauri::State<'_, Arc<BackendManager>>) -> Result<(),
     Ok(())
 }
 
+/// 本地代理端口 —— 自研界面用它拼后端地址(见 `src-tauri/src/dsh/proxy.rs`)。
+#[tauri::command]
+async fn backend_proxy_port(state: tauri::State<'_, Arc<BackendManager>>) -> Result<Option<u16>, String> {
+    Ok(state.proxy_port().await)
+}
+
 #[tauri::command]
 fn env_report() -> EnvReport {
     dsh::locate::env_report()
@@ -195,6 +201,7 @@ pub fn run() {
             backend_stop,
             backend_restart,
             open_dsh_ui,
+            backend_proxy_port,
             env_report,
             plugin_snapshot,
             reveal_in_finder,

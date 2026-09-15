@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 
 use super::locate;
 use super::paths;
+use super::proxy;
 
 pub const EVENT_STATUS: &str = "backend://status";
 pub const EVENT_LOG: &str = "backend://log";
@@ -115,6 +116,8 @@ struct Inner {
     pending_pid: Option<u32>,
     /// spawn 时刻,用来报告启动耗时(性能是可测量的,不靠感觉)。
     spawn_at: Option<std::time::Instant>,
+    /// 本地代理端口(界面通过它访问 dsh,绕开浏览器的 cookie/围栏限制)。
+    proxy_port: Option<u16>,
     /// 正在被我们主动停止 —— 用于区分「意外退出」和「按预期退出」。
     stopping: bool,
     logs: VecDeque<LogLine>,
@@ -461,6 +464,8 @@ struct OpenOutcome {
     messages: Vec<String>,
     opened: bool,
     root: Option<url::Url>,
+    /// 代理上游信息(dsh 端口 + 授权 cookie);拿到后才能给界面提供可用的访问入口。
+    upstream: Option<(u16, String)>,
 }
 
 /// 把一个子进程输出流按行泵进日志。
@@ -483,6 +488,7 @@ impl BackendManager {
                 running: None,
                 pending_pid: None,
                 spawn_at: None,
+                proxy_port: None,
                 stopping: false,
                 logs: VecDeque::new(),
                 seq: 0,
@@ -540,13 +546,41 @@ impl BackendManager {
     /// async 外壳只负责写日志 —— 这样**没有任何窗口对象被跨越 `await` 持有**,
     /// future 必然是 Send(之前正是在这点上反复编译不过)。
     async fn open_backend_window(&self, url: &str) {
-        let outcome = self.open_backend_window_sync(url);
-        for message in outcome.messages {
-            self.log("system", message).await;
+        let upstream = {
+            let outcome = self.open_backend_window_sync(url);
+            for message in outcome.messages {
+                self.log("system", message).await;
+            }
+            if outcome.opened {
+                self.spawn_window_probe(outcome.root);
+            }
+            outcome.upstream
+        };
+
+        // 给「我们自己的界面」准备访问入口(见 proxy.rs 的说明)。
+        if let Some((port, cookie)) = upstream {
+            match proxy::serve(std::sync::Arc::new(proxy::Upstream { port, cookie })).await {
+                Ok(proxy_port) => {
+                    {
+                        let mut inner = self.inner.lock().await;
+                        inner.proxy_port = Some(proxy_port);
+                    }
+                    self.log(
+                        "system",
+                        format!("dsh 代理就绪:127.0.0.1:{proxy_port}(自研界面的访问入口)"),
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    self.log("system", format!("启动 dsh 代理失败: {e}")).await;
+                }
+            }
         }
-        if outcome.opened {
-            self.spawn_window_probe(outcome.root);
-        }
+    }
+
+    /// 当前代理端口(界面用它拼后端地址)。
+    pub async fn proxy_port(&self) -> Option<u16> {
+        self.inner.lock().await.proxy_port
     }
 
     /// 同步核心:解析地址 → 换 cookie → 注入 → 建/复用窗口 → 显示。
@@ -554,9 +588,10 @@ impl BackendManager {
         let mut messages: Vec<String> = Vec::new();
         let Ok(parsed) = url::Url::parse(url) else {
             messages.push(format!("后端地址无法解析:{url}"));
-            return OpenOutcome { messages, opened: false, root: None };
+            return OpenOutcome { messages, opened: false, root: None, upstream: None };
         };
         let root = url::Url::parse(&format!("{}/", parsed.origin().ascii_serialization())).ok();
+        let upstream_port = parsed.port();
         let has_token = parsed.query_pairs().any(|(k, _)| k == "token");
 
         // 自己把 token 换成 cookie(原因见 exchange_with_cookie 的注释)
@@ -578,6 +613,11 @@ impl BackendManager {
         } else {
             None
         };
+
+        // 代理需要 `name=value` 形式
+        let auth_pair = cookie
+            .as_ref()
+            .map(|c| (c.name().to_string(), c.value().to_string()));
 
         // 拿到 cookie 就用干净的根地址(不再需要 token)
         let target = match (&cookie, &root) {
@@ -623,7 +663,7 @@ impl BackendManager {
                     Ok(w) => w,
                     Err(e) => {
                         messages.push(format!("创建 dsh 窗口失败: {e}"));
-                        return OpenOutcome { messages, opened: false, root };
+                        return OpenOutcome { messages, opened: false, root, upstream: None };
                     }
                 }
             }
@@ -659,7 +699,13 @@ impl BackendManager {
             let _ = main.hide();
         }
 
-        OpenOutcome { messages, opened: true, root }
+        // 供代理使用:代理要替界面补上这两个东西
+        let upstream = match (upstream_port, &auth_pair) {
+            (Some(port), Some((name, value))) => Some((port, format!("{name}={value}"))),
+            _ => None,
+        };
+
+        OpenOutcome { messages, opened: true, root, upstream }
     }
 
     /// 6 秒后回读窗口状态、cookie 明细与页面自报。
@@ -1142,6 +1188,7 @@ impl BackendManager {
 
         self.pid_snapshot.store(0, Ordering::SeqCst);
         pidfile_clear();
+        self.inner.lock().await.proxy_port = None;
         {
             let mut inner = self.inner.lock().await;
             inner.running = None;

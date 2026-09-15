@@ -6,5 +6,6 @@ pub mod backend;
 pub mod locate;
 pub mod paths;
 pub mod profile;
+pub mod proxy;
 
 pub use backend::{BackendManager, BackendStatus, LogLine};
