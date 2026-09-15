@@ -102,10 +102,8 @@ onMounted(async () => {
       if (logs.value.length > 800) logs.value.splice(0, logs.value.length - 800);
     }),
   );
-  // 「打开客户端就能用」:主窗口进入且后端未运行时直接拉起,不让用户先点按钮。
-  if (status.value.phase === "idle") {
-    void act(api.start);
-  }
+  // 注意:后端是由 Rust 侧在应用启动时拉起的,这里**不**自动启动 ——
+  // 保持单一启动源,避免两个地方各起一次;这个页面的按钮只用于手动重试。
 });
 
 onUnmounted(() => {

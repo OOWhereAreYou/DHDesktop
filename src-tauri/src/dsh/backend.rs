@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -26,6 +26,14 @@ use super::paths;
 
 pub const EVENT_STATUS: &str = "backend://status";
 pub const EVENT_LOG: &str = "backend://log";
+
+/// dsh 自带界面的窗口 label。
+/// 它跑的是远程页面(http://127.0.0.1:<port>),因此**不在** capabilities 的 windows 列表里
+/// —— 它不需要也不应该拿 Tauri IPC 权限。
+pub const WINDOW_BACKEND: &str = "dsh";
+
+/// 启动页窗口 label(就绪后会被收起)。
+const WINDOW_MAIN: &str = "main";
 
 /// 日志环形缓冲上限。
 const MAX_LOG_LINES: usize = 800;
@@ -119,8 +127,6 @@ pub struct BackendManager {
     /// 仅靠 `inner` 的锁会有 TOCTOU 窗口 —— 两个并发调用能同时穿过检查,
     /// 结果起出两个 dsh(实测发生过:两个进程相差 33ms)。
     lifecycle: Mutex<()>,
-    /// 主窗口原本的地址(我们自己的前端),用于从 dsh 界面切回来。
-    home_url: Mutex<Option<url::Url>>,
     /// 无锁的 pid 快照,给退出时的同步清理用。
     pid_snapshot: AtomicU32,
     app: AppHandle,
@@ -285,6 +291,157 @@ fn cleanup_stale_backend() -> Option<String> {
     ))
 }
 
+// ---- token → cookie 交换 ----
+//
+// 为什么不让 WebView 自己走那个 303:实测在 WKWebView 里 cookie 没有落地
+// (`cookies_for_url` 返回 0),页面停在 401「dsh web authentication required」。
+// dsh 自己的提示也说明了这点 —— 「reopen the URL printed by dsh web」。
+// 这件事依赖浏览器的 cookie 策略(第三方 cookie / SameSite 在跳转时的行为),
+// 不可控;所以改成自己发一个最简 HTTP 请求把 token 换成 cookie,再显式注入窗口。
+// 只取 Set-Cookie 的 name=value,不管其它属性 —— 属性由我们构造时决定。
+fn exchange_with_cookie(url: &url::Url) -> Option<(String, String)> {
+    use std::io::{Read, Write};
+
+    let host = url.host_str()?;
+    let port = url.port()?;
+    let mut target = url.path().to_string();
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+
+    let mut stream = std::net::TcpStream::connect((host, port)).ok()?;
+    let timeout = Some(Duration::from_secs(5));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+
+    // 故意不发 Origin —— 围栏对无 Origin 的客户端放行(实测)。
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+
+    for line in String::from_utf8_lossy(&raw).lines() {
+        let trimmed = line.trim_start();
+        let bytes = trimmed.as_bytes();
+        // 字节级比较,避免多字节字符上切片越界
+        if bytes.len() > 11 && bytes[..11].eq_ignore_ascii_case(b"set-cookie:") {
+            let pair = trimmed[11..].split(';').next()?.trim();
+            let (name, value) = pair.split_once('=')?;
+            return Some((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    None
+}
+
+fn build_cookie(host: &str, name: &str, value: &str) -> tauri::webview::cookie::Cookie<'static> {
+    use tauri::webview::cookie::{Cookie, SameSite};
+    let mut cookie = Cookie::new(name.to_string(), value.to_string());
+    cookie.set_path("/");
+    cookie.set_domain(host.to_string());
+    cookie.set_http_only(true);
+    // 与服务端一致。注入后我们马上导航到同源的根地址,同站请求会带上它。
+    cookie.set_same_site(SameSite::Strict);
+    cookie
+}
+
+/// 页面自报探针:让窗口里的页面把标题与正文头一段发回本地一个临时端口。
+///
+/// 存在的理由:判断“界面到底加载成功没有”很不好做 —— 回读 URL 只能说明跳转发生了
+/// (之前就是被这个不充分的判据骗过),cookie 数在 macOS 上又不可靠(`cookies_for_url`
+/// 实测会误报 0)。直接让页面自报内容,才是确定的信号。
+///
+/// 用 `DHDESKTOP_PAGE_PROBE=1` 开启,平时不监听端口。
+async fn page_report_probe(window: tauri::WebviewWindow, tag: &'static str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let Ok(addr) = listener.local_addr() else { return };
+    let port = addr.port();
+
+    // 页面与探针不同源,所以这是一次跨源请求:响应会被浏览器拦下,
+    // 但请求本身已经发出去了 —— 我们要的就是服务端收到的那一发。
+    let js = format!(
+        "try{{fetch('http://127.0.0.1:{port}/report?tag={tag}&text='+encodeURIComponent((document.title||'')+' :: '+(document.body?document.body.innerText.slice(0,160):'(no body)'))).catch(()=>{{}})}}catch(e){{}}"
+    );
+    if let Err(e) = window.eval(&js) {
+        println!("[probe] eval 失败: {e}");
+        return;
+    }
+
+    if let Ok(Ok((mut sock, _))) = tokio::time::timeout(Duration::from_secs(6), listener.accept()).await {
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        if let Some(line) = request.lines().next() {
+            println!("[probe] {tag} 页面自报: {}", percent_decode(line));
+        }
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+    } else {
+        println!("[probe] {tag} 页面没有任何自报(可能没加载 JS 环境)");
+    }
+}
+
+/// 只处理 %XX 与 '+' 的简易解码,够看报告文本用。
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 调试开关:控制台诊断输出(包括 cookie 明细与页面自报探针)。
+fn debug_enabled() -> bool {
+    std::env::var("DHDESKTOP_DEBUG").is_ok() || std::env::var("DHDESKTOP_PAGE_PROBE").is_ok()
+}
+
+/// 清掉历史遗留的授权 cookie。
+///
+/// 每次运行端口都变,cookie 名也会变(服务端用 authority 的哈希命名),
+/// 不清理就会在 WebView 存储里越积越多(实测一次调试就攒了 14 个)。
+/// 只删我们自己的前缀,不碰其它 cookie。
+fn purge_stale_auth_cookies(window: &tauri::WebviewWindow) {
+    let Ok(cookies) = window.cookies() else { return };
+    for cookie in cookies {
+        if cookie.name().starts_with("dsh-auth-") {
+            let _ = window.delete_cookie(cookie);
+        }
+    }
+}
+
 impl BackendManager {
     pub fn new(app: AppHandle) -> Self {
         Self {
@@ -297,15 +454,9 @@ impl BackendManager {
                 seq: 0,
             }),
             lifecycle: Mutex::new(()),
-            home_url: Mutex::new(None),
             pid_snapshot: AtomicU32::new(0),
             app,
         }
-    }
-
-    /// 记录主窗口的初始地址(我们自己的前端页面)。
-    pub async fn remember_home_url(&self, url: url::Url) {
-        *self.home_url.lock().await = Some(url);
     }
 
     pub async fn status(&self) -> BackendStatus {
@@ -345,47 +496,205 @@ impl BackendManager {
         self.emit_log(&mut inner, stream, text);
     }
 
-    /// 把主窗口导航到指定地址;传 `None` 表示切回我们自己的前端页面。
+    /// 打开(或聚焦)dsh 界面窗口。
     ///
-    /// `reason` 会写进日志 —— 导航会导致窗口重载,出问题时必须能追到是谁触发的。
-    async fn navigate_main(&self, target: Option<String>, reason: &str) {
-        let url = match target {
-            Some(u) => url::Url::parse(&u).ok(),
-            None => self.home_url.lock().await.clone(),
-        };
-        let Some(url) = url else { return };
-        let Some(window) = self.app.get_webview_window("main") else {
+    /// **必须是独立窗口,且第一跳就是带 token 的 URL。**
+    ///
+    /// 这是修正过的一个真实 bug:早先的实现是从应用自己的页面(`tauri://localhost`)
+    /// 导航过去,构成**跨站导航** —— dsh 的授权 cookie 实测是 `HttpOnly; SameSite=Strict`,
+    /// 跨站场景下要么被第三方 cookie 策略挡掉、要么在跳转时不被带上,
+    /// 结果落到 401「dsh web authentication required」。
+    /// 新窗口没有跨站来源,就不存在这个问题。
+    async fn open_backend_window(&self, url: &str) {
+        let Ok(parsed) = url::Url::parse(url) else {
+            self.log("system", format!("后端地址无法解析:{url}")).await;
             return;
         };
-        let shown = url.to_string();
-        match window.navigate(url) {
-            Ok(()) => {
-                self.log("system", format!("主窗口导航到 {shown}({reason})"))
-                    .await;
-                // 回读实际 URL:`navigate()` 返回 Ok 不代表页面真的过去了,
-                // 只有回读才能区分「导航被静默丢弃」和「页面加载失败」。
-                let probe = self.app.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    if let Some(w) = probe.get_webview_window("main") {
-                        match w.url() {
-                            Ok(u) => println!("[dsh] 主窗口当前 URL = {u}"),
-                            Err(e) => println!("[dsh] 回读主窗口 URL 失败: {e}"),
-                        }
+        let root = url::Url::parse(&format!("{}/", parsed.origin().ascii_serialization())).ok();
+        let has_token = parsed.query_pairs().any(|(k, _)| k == "token");
+
+        // 自己把 token 换成 cookie(原因见 exchange_with_cookie 的注释)
+        let cookie = if has_token {
+            match exchange_with_cookie(&parsed) {
+                Some((name, value)) => {
+                    self.log("system", format!("已取得授权 cookie:{name}")).await;
+                    Some(build_cookie(
+                        parsed.host_str().unwrap_or("127.0.0.1"),
+                        &name,
+                        &value,
+                    ))
+                }
+                None => {
+                    self.log("system", "token 交换失败,退回直接打开带 token 的地址".to_string())
+                        .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // 拿到 cookie 就用干净的根地址(不再需要 token)
+        let target = match (&cookie, &root) {
+            (Some(_), Some(r)) => r.clone(),
+            _ => parsed.clone(),
+        };
+
+        // 关键时序:**先把 cookie 写进 WebView 的 cookie 存储,再创建 dsh 窗口**。
+        //
+        // cookie 存储是应用级的(WKWebView 的默认 data store),所以先写进主窗口的存储,
+        // dsh 窗口第一次加载就带授权。早先是反过来的(先建窗口加载→再注入→再重载),
+        // 实测那次重载不会带上 cookie,页面就停在 401。
+        if let Some(cookie) = cookie.clone() {
+            let store_owner = self
+                .app
+                .get_webview_window(WINDOW_MAIN)
+                .or_else(|| self.app.get_webview_window(WINDOW_BACKEND));
+            match store_owner {
+                Some(w) => {
+                    // 先清旧(含本次之前写入的),再写新 —— 保证留下的是当前这枚
+                    purge_stale_auth_cookies(&w);
+                    if let Err(e) = w.set_cookie(cookie) {
+                        self.log("system", format!("注入授权 cookie 失败: {e}")).await;
                     }
-                });
+                }
+                None => {
+                    self.log("system", "没有可用窗口写入 cookie".to_string()).await;
+                }
             }
-            Err(e) => {
-                let mut inner = self.inner.lock().await;
-                self.emit_log(&mut inner, "system", format!("导航主窗口失败: {e}"));
+        }
+
+        let (window, created) = match self.app.get_webview_window(WINDOW_BACKEND) {
+            Some(w) => (w, false),
+            None => {
+                let built = WebviewWindowBuilder::new(
+                    &self.app,
+                    WINDOW_BACKEND,
+                    WebviewUrl::External(target.clone()),
+                )
+                .title("DeepSeek Harness")
+                .inner_size(1280.0, 832.0)
+                .min_inner_size(960.0, 600.0)
+                // 先隐藏:避免用户看到未授权的那一次加载
+                .visible(false)
+                .build();
+                match built {
+                    Ok(w) => (w, true),
+                    Err(e) => {
+                        self.log("system", format!("创建 dsh 窗口失败: {e}")).await;
+                        return;
+                    }
+                }
             }
+        };
+
+        if !created && cookie.is_none() {
+            let _ = window.navigate(parsed.clone());
+        }
+
+        // cookie 已在建窗前写入;这里再向 dsh 窗口自己写一次(防止存储不共享),
+        // 然后显式导航一次 —— 兼顾窗口复用与存储不共享两种情况,不依赖假设。
+        if let Some(cookie) = cookie {
+            if let Err(e) = window.set_cookie(cookie) {
+                self.log("system", format!("向 dsh 窗口注入 cookie 失败: {e}")).await;
+            }
+            if let Some(r) = root.clone() {
+                if let Err(e) = window.navigate(r) {
+                    self.log("system", format!("导航 dsh 窗口失败: {e}")).await;
+                }
+            }
+        }
+
+        let _ = window.show();
+        let _ = window.set_focus();
+        self.log("system", format!("dsh 界面已打开:{target}")).await;
+
+        // 收起启动页:正常使用时用户只应该看到 dsh 一个窗口。
+        // 需要控制台时用菜单(⌘⇧P)重新拿出来。
+        if let Some(main) = self.app.get_webview_window(WINDOW_MAIN) {
+            let _ = main.hide();
+        }
+
+        // 后台回读诊断。
+        // 注意:只回读「跳转是否发生」是不够的 —— 之前正是靠这个不充分的判据
+        // 误报了“加载成功”,实际页面是 401。cookie 数才是真正能区分的信号。
+        let app = self.app.clone();
+        let probe_url = root;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let Some(window) = app.get_webview_window(WINDOW_BACKEND) else {
+                return;
+            };
+            let url = window.url().map(|u| u.to_string()).unwrap_or_default();
+            let by_url = probe_url
+                .clone()
+                .and_then(|u| window.cookies_for_url(u).ok())
+                .map(|c| c.len());
+            let all = window.cookies().map(|c| c.len());
+            println!(
+                "[dsh] 窗口 url={url} 根地址 cookie 数={by_url:?} 全部 cookie 数={all:?}"
+            );
+            // 明细:判断到底是「没存进去」还是「存了但不发送」
+            if debug_enabled() {
+                if let Ok(cookies) = window.cookies() {
+                    for c in cookies {
+                        println!(
+                            "[dsh]   cookie name={} domain={:?} path={:?} sameSite={:?} secure={}",
+                            c.name(),
+                            c.domain(),
+                            c.path(),
+                            c.same_site(),
+                            c.secure().unwrap_or(false),
+                        );
+                    }
+                }
+            }
+
+            // 让页面自己报告渲染了什么(见 page_report_probe 的说明)
+            if std::env::var("DHDESKTOP_PAGE_PROBE").is_ok() {
+                page_report_probe(window.clone(), "dsh").await;
+            }
+
+            // 验证 UX 约定:正常运行时用户应该只看到 dsh 窗口
+            if debug_enabled() {
+                let main_visible = app
+                    .get_webview_window(WINDOW_MAIN)
+                    .and_then(|w| w.is_visible().ok());
+                let dsh_visible = app
+                    .get_webview_window(WINDOW_BACKEND)
+                    .and_then(|w| w.is_visible().ok());
+                println!("[dsh] 窗口可见性 main={main_visible:?} dsh={dsh_visible:?}");
+            }
+        });
+    }
+
+    /// 把启动页露出来 —— 后端不可用或出了问题时用户需要看到状态。
+    /// 正常启动流程不会叫它:那时用户只应该看到 dsh 界面。
+    pub fn show_main_window(&self) {
+        if let Some(main) = self.app.get_webview_window(WINDOW_MAIN) {
+            let _ = main.show();
+            let _ = main.set_focus();
         }
     }
 
-    /// 把主窗口切到已就绪的 dsh 界面。(切走后前端上下文会重载。)
+    /// 关闭 dsh 界面窗口(后端停止/退出时),并把启动页露出来
+    /// —— 这时用户需要看到状态与错误原因。
+    fn close_backend_window(&self) {
+        if let Some(window) = self.app.get_webview_window(WINDOW_BACKEND) {
+            let _ = window.close();
+        }
+        self.show_main_window();
+    }
+
+    /// 打开或聚焦 dsh 界面(菜单「打开 dsh 界面」)。
     pub async fn open_dsh_ui(&self) {
-        let target = self.inner.lock().await.status.ready_url();
-        self.navigate_main(target, "显式打开 dsh 界面").await;
+        match self.inner.lock().await.status.ready_url() {
+            Some(url) => self.open_backend_window(&url).await,
+            None => {
+                self.log("system", "后端未运行,无法打开 dsh 界面".to_string())
+                    .await;
+            }
+        }
     }
 
     /// 启动后端。已在运行或正在启动时直接返回当前状态。
@@ -422,6 +731,8 @@ impl BackendManager {
                 let mut inner = self.inner.lock().await;
                 self.emit_log(&mut inner, "system", message.clone());
                 self.emit_status(&mut inner, BackendStatus::Failed { message: message.clone() });
+                drop(inner);
+                self.show_main_window();
                 return BackendStatus::Failed { message };
             }
         };
@@ -482,6 +793,8 @@ impl BackendManager {
                 let mut inner = self.inner.lock().await;
                 self.emit_log(&mut inner, "system", message.clone());
                 self.emit_status(&mut inner, BackendStatus::Failed { message: message.clone() });
+                drop(inner);
+                self.show_main_window();
                 return BackendStatus::Failed { message };
             }
         };
@@ -490,6 +803,8 @@ impl BackendManager {
             let message = "启动 dsh 失败:拿不到子进程 pid".to_string();
             let mut inner = self.inner.lock().await;
             self.emit_status(&mut inner, BackendStatus::Failed { message: message.clone() });
+            drop(inner);
+            self.show_main_window();
             return BackendStatus::Failed { message };
         };
 
@@ -531,7 +846,7 @@ impl BackendManager {
                         );
                         drop(inner);
                         me.log("system", format!("dsh 后端就绪:{program}")).await;
-                        me.navigate_main(Some(info.url), "后端就绪").await;
+                        me.open_backend_window(&info.url).await;
                     }
                 }
             });
@@ -567,7 +882,7 @@ impl BackendManager {
                     let _ = terminate(pid, TERM_GRACE).await;
                     signal_group(pid, libc::SIGKILL);
                     me.pid_snapshot.store(0, Ordering::SeqCst);
-                    me.navigate_main(None, "启动超时").await;
+                    me.close_backend_window();
                 }
             });
         }
@@ -600,7 +915,7 @@ impl BackendManager {
                     me.emit_status(&mut inner, BackendStatus::Failed { message });
                 }
                 drop(inner);
-                me.navigate_main(None, "后端退出").await;
+                me.close_backend_window();
             });
         }
 
@@ -654,7 +969,7 @@ impl BackendManager {
             inner.stopping = false;
             self.emit_status(&mut inner, BackendStatus::Idle);
         }
-        self.navigate_main(None, "已停止").await;
+        self.close_backend_window();
         BackendStatus::Idle
     }
 

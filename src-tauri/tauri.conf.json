@@ -12,11 +12,13 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "DHDesktop",
-        "width": 1280,
-        "height": 832,
-        "minWidth": 960,
-        "minHeight": 600
+        "width": 1080,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
+        "visible": false
       }
     ],
     "security": {

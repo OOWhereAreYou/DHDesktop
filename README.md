@@ -75,6 +75,28 @@ pnpm build            # 仅前端:vue-tsc 类型检查 + vite build
 
 要求:Node.js 20+、Rust stable、Xcode Command Line Tools(macOS)。
 
+## 窗口模型
+
+启动时**不显示我们自己的任何窗口**,直接把 dsh 界面推上来:
+
+| 窗口 | 用途 | 何时可见 |
+| --- | --- | --- |
+| `dsh` | dsh 自带界面(真正的主窗口) | 后端就绪后自动出现 |
+| `main` | 启动页 / 状态与日志 | **只在出错时**自动出现;平时需用菜单 ⌘⇧P 打开 |
+| `console` | 控制台(后端 / 插件 / 诊断) | 菜单 ⌘⇧P |
+
+- 后端由 **Rust 在应用启动时拉起**,不依赖前端加载 —— 保持单一启动源。
+- 点 Dock 图标(且当前无可见窗口时)→ 回到 **dsh 界面**(后端没在跑才回落到状态页)。
+
+## dsh 界面怎么加载(这里踩过坑,看 `docs/recon-dsh.md` 第 5 节)
+
+不能简单地把窗口导航到 `http://127.0.0.1:<port>/?token=...`。正确做法:
+
+1. Rust 自己发一个 HTTP 请求把 token 换成 cookie(`Host: 127.0.0.1:<port>`,不带 Origin);
+2. **先**把 cookie 写进窗口的 cookie 存储,**再**创建 dsh 窗口并加载干净的根地址。
+
+顺序反了(先建窗口再注入)实测会停在 401「dsh web authentication required」。
+
 ## 数据目录(决策:完全独立)
 
 DHDesktop **不用**用户机器上那个共享的 `~/.dsh`,而是用应用自己的目录:

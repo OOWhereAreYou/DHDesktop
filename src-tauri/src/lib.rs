@@ -18,7 +18,6 @@ use dsh::locate::EnvReport;
 use dsh::profile::PluginSnapshot;
 use dsh::{BackendManager, BackendStatus, LogLine};
 
-const MAIN_WINDOW: &str = "main";
 const CONSOLE_WINDOW: &str = "console";
 
 // ---------------------------------------------------------------- commands
@@ -152,14 +151,14 @@ pub fn run() {
             let manager = Arc::new(BackendManager::new(handle.clone()));
             app.manage(Arc::clone(&manager));
 
-            // 记住主窗口的初始地址(我们自己的前端),便于从 dsh 界面切回来。
-            if let Some(main) = app.get_webview_window(MAIN_WINDOW) {
-                if let Ok(url) = main.url() {
-                    let manager = Arc::clone(&manager);
-                    tauri::async_runtime::spawn(async move {
-                        manager.remember_home_url(url).await;
-                    });
-                }
+            // 后端由 Rust 自己拉起:
+            // 不依赖前端加载、也不显示我们的窗口 —— 「打开客户端就是 dsh」。
+            // 启动中用户看不到窗口是故意的(启动页只在出错时自动出现)。
+            {
+                let manager = Arc::clone(&manager);
+                tauri::async_runtime::spawn(async move {
+                    manager.start().await;
+                });
             }
 
             let menu = build_menu(&handle)?;
@@ -203,12 +202,30 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app_handle, event| {
-        if let RunEvent::ExitRequested { .. } | RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        RunEvent::ExitRequested { .. } | RunEvent::Exit => {
             if let Some(state) = app_handle.try_state::<Arc<BackendManager>>() {
                 // 同步清理子进程,避免退出后留下游离的 dsh。
                 state.kill_now();
             }
         }
+        // 点 Dock 图标且当前没有可见窗口时 —— 用户要的是 dsh 界面,不是我们的状态页。
+        // 后端没在跑才把启动页露出来(否则用户会以为应用卡死了)。
+        RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => {
+            if let Some(state) = app_handle.try_state::<Arc<BackendManager>>() {
+                let manager = Arc::clone(&state);
+                tauri::async_runtime::spawn(async move {
+                    if manager.status().await.is_ready() {
+                        manager.open_dsh_ui().await;
+                    } else {
+                        manager.show_main_window();
+                    }
+                });
+            }
+        }
+        _ => {}
     });
 }

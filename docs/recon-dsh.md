@@ -77,7 +77,22 @@ dsh plugin --profile <name> <pnpm 参数...>  # 转发给 profile 目录里的 p
 
 ---
 
-## 5. 启动、就绪、鉴权(全部实测)
+## 5. 启动、就绪与鉴权(全部实测)
+
+### 鉴权的实现细节(读源码: `packages/client/connection/src/browser-auth.ts`)
+
+`isAuthenticated()` 只看两样东西:**`Host` 头** 与 **`Cookie` 头**。
+
+```
+authority = host 头                     // 如 127.0.0.1:50000
+cookie 名  = dsh-auth-<hash(authority)>
+cookie 值  = v1.<base64 payload>.<hmac>   // 用 credentials 里的 secret 签名
+payload   = { version, authority, issuedAt, expiresAt }
+```
+
+- `authorizeIndex()`:带 `?token=<launchToken>` 的 `GET /` → 303 + `Set-Cookie`;其它情况必须带有效 cookie,否则 401 纯文本「dsh web authentication required; reopen the URL printed by dsh web.」
+- token 是无状态的(与进程启动 token 比对),**可以反复使用**,不是一次性的。
+- 要点:**既然只认 Host/Cookie 两个头,那能自由设头的非浏览器客户端(比如 Rust 代理)也能通过鉴权。**
 
 ### 启动
 
@@ -106,11 +121,26 @@ dsh web: http://127.0.0.1:3899/?token=BNHjr4KcVzcYGtmEyrM1OG0_ydKK6y83nDT826LTBK
 
 **推论:**
 
-1. **官方 Web UI 装进 Tauri WebView 是最省事的方案** —— 同 origin,303→cookie→SPA 全自动。
-2. 自研 UI 若从 `tauri://localhost` 或 Vite dev server 发起请求 → **403**。必须二选一:
-   - Rust 侧代理(自己写 `Origin: http://127.0.0.1:<port>`,并携带 cookie);
-   - 或 `--trusted-host <我们的 authority>` 把开发 origin 加进白名单(需验证是否接受端口/非 http scheme)。
-3. iframe 嵌套**没有** `X-Frame-Options` / CSP `frame-ancestors` 限制(实测响应头只有 `content-type`),所以「自研 Vue 外壳 + iframe 嵌官方 UI」在技术上也成立。
+1. **官方 UI 装进 WebView 的正确做法(已实现)**:
+   - 不要从我们自己的页面导航过去(跨站导航会让那枚 `SameSite=Strict` cookie 不被带上,页面停在 401——实际踩过)。
+   - 也不要“先建窗口加载、再注入 cookie、再重载”(实测重载不带 cookie)。
+   - **正确顺序**:Rust 先用自己的 HTTP 请求把 token 换成 cookie → **先写入窗口的 cookie 存储** → 再创建窗口加载干净的根地址。
+2. 自研 UI 若从 `tauri://localhost` 或 Vite dev server 发请求 → **403**。必须二选一:
+   - Rust 侧正向代理(自己写 `Host` / `Origin` 并携带 cookie);
+   - 或 `--trusted-host` 把开发 origin 加进白名单。
+3. iframe 嵌套**没有** `X-Frame-Options` / CSP `frame-ancestors` 限制(实测响应头只有 `content-type`)。
+
+### 验证手段的教训(重要)
+
+判断「界面到底加载成功没有」不能靠间接信号:
+
+| 手段 | 结果 |
+| --- | --- |
+| 回读窗口 URL(token 被消费 → `/`) | ❌ **误导**:只要跟随了 303 就会变,401 页面也一样 |
+| `webview.cookies_for_url(url)` | ❌ **误导**:macOS 上实测恒返回 0(全部 cookie 里明明有那枚) |
+| **让页面自己报告**(Rust 临时监听一个环回端口,让页面 `fetch` 回自己的 `document.title` 与正文) | ✅ 确定:401 是 `text/plain` 无标题,SPA 标题是 `DeepSeek Harness` |
+
+最后这个探针实现在 `src-tauri/src/dsh/backend.rs` 的 `page_report_probe()`,用 `DHDESKTOP_PAGE_PROBE=1` 开启。
 
 ---
 
