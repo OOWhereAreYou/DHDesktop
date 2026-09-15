@@ -153,9 +153,9 @@ onUnmounted(() => {
 
         <div v-if="ownerMismatch" class="note warn">
           <strong>{{ env?.dshHome }}</strong> 的属主是 uid {{ env?.dshHomeOwner }},不是当前用户(uid
-          {{ env?.currentUid }}),所以 dsh 无法写入而启动失败。通常是因为以前用 <code>sudo</code> 跑过
-          dsh。修复:
-          <code>sudo chown -R $(whoami) ~/.dsh</code>
+          {{ env?.currentUid }}),所以 dsh 无法写入而启动失败。常见原因:本应用曾被
+          <code>sudo</code> 启动过。修复:
+          <code>sudo chown -R $(whoami) "{{ env?.dshHome }}"</code>
         </div>
 
         <div v-if="noDsh" class="note warn">

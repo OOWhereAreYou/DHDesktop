@@ -75,6 +75,29 @@ pnpm build            # 仅前端:vue-tsc 类型检查 + vite build
 
 要求:Node.js 20+、Rust stable、Xcode Command Line Tools(macOS)。
 
+## 数据目录(决策:完全独立)
+
+DHDesktop **不用**用户机器上那个共享的 `~/.dsh`,而是用应用自己的目录:
+
+```
+~/Library/Application Support/com.dhdesktop.app/
+└── dsh-home/                     ← 传给 dsh 子进程的 DSH_HOME
+    ├── profiles/dhdesktop/       插件与依赖图
+    ├── .credentials.yaml         dsh 凭据(客户端内配置)
+    ├── settings.yaml             dsh 设置
+    ├── storages/                 会话历史
+    └── dhdesktop-backend.pid     后端进程组 id(残留清理用)
+```
+
+**为什么:** 客户端与用户自己装的/命令行的 dsh 互不干涉 —— 任一边被改坏(权限、删改、版本冲突)
+不影响另一边。实测确认:运行前后 `~/.dsh` 的文件指纹完全一致。
+
+**代价:** 凭据与会话历史**不共享**。如果用户在命令行 dsh 里已经配过 API key,
+客户端里需要再配一次(配置写在上面的私有目录里,不是 `~/.dsh`)。
+
+> 调试/测试时可用 `DHDESKTOP_DSH_HOME=/tmp/xxx` 覆盖。注意刻意**不**沿用 `DSH_HOME` ——
+> 那是命令行 dsh 的开关,用它会破坏「完全独立」这个前提。
+
 ## 当前状态
 
 - [x] 项目初始化(Tauri v2 + Vue 3 + TS + Vite 模板)
@@ -97,7 +120,7 @@ pnpm build            # 仅前端:vue-tsc 类型检查 + vite build
 * **按进程组收尾**:`dsh`(尤其 npx 路径)是「npx → npm exec → node dsh」三层进程树,
   只杀直接子进程会把真正的服务留下变孤儿(实测确认),所以子进程用 `setpgid` 自成进程组,
   停止时向整组发信号。
-* **残留清理**:进程组 id 落盘到 `$DSH_HOME/dhdesktop-backend.pid`。应用被强杀/崩溃时退出钩子
+* **残留清理**:进程组 id 落盘到应用数据目录(`dsh-home/dhdesktop-backend.pid`)。应用被强杀/崩溃时退出钩子
   不会执行,下次启动会先扫一遍并收掉残留(启动前会用 `ps` 核对确实是我们的 profile,避免 pgid 复用误杀)。
 * **GUI 启动的 PATH 问题**:Finder 启动的应用只拿到 `/usr/bin:/bin:/usr/sbin:/sbin`,
   连 `node` 都找不到(`dsh`/`npx` 都是 `#!/usr/bin/env node`),所以会主动探测 Homebrew / nvm /
@@ -109,8 +132,8 @@ pnpm build            # 仅前端:vue-tsc 类型检查 + vite build
 
 1. **`npx` 兜底代价大**:若系统里没有全局 `dsh`,会退到 `npx -y @deepseek-ai/dsh@latest`,
    首次要下载约 **292MB**。终态方案是随安装包内置 Node + dsh(官方 Electron 版就是这么做的)。
-2. **`~/.dsh` 属主问题**:若该目录曾被 `sudo` 使用过(属主变成 root),普通用户完全无法启动 dsh。
-   控制台「诊断」页会检测并提示:`sudo chown -R $(whoami) ~/.dsh`。
+2. **数据目录不共享**:客户端用独立数据目录(见上)。用户如果在命令行 dsh 里配过 API key,
+   需要在客户端内再配一次;会话历史同理也不互通。
 3. **协议围栏**:dsh 的 `/api` 有 Origin 信任围栏(非本服务 origin 返回 403),
    且 cookie 是 `SameSite=Strict; HttpOnly`。因此自研界面**不能**直接跨 origin 调 API,
    必须走 Rust 代理 —— 这也是当前阶段直接复用 dsh 自带界面的原因。

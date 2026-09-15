@@ -200,20 +200,6 @@ pub fn child_path_env() -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
 }
 
-fn writable(dir: &Path) -> bool {
-    if std::fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let probe = dir.join(".dhdesktop-write-probe");
-    match std::fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(unix)]
 fn owner_uid(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
@@ -253,7 +239,7 @@ pub fn env_report() -> EnvReport {
     EnvReport {
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         dsh_home_exists: home.exists(),
-        dsh_home_writable: writable(&home),
+        dsh_home_writable: paths::is_writable(&home),
         dsh_home_owner: owner_uid(&home),
         current_uid: current_uid(),
         dsh_home: home.display().to_string(),

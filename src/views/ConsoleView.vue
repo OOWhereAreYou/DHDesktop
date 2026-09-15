@@ -227,6 +227,10 @@ onUnmounted(() => {
             <span v-else class="bad">
               不可写 · 属主 uid {{ env.dshHomeOwner }}(当前 {{ env.currentUid }})
             </span>
+            <div class="dim">
+              这是 DHDesktop <strong>独立</strong>的数据目录,与用户自行安装的 dsh 所用的
+              <code>~/.dsh</code> 互不影响。
+            </div>
           </dd>
           <dt>profile</dt>
           <dd>
@@ -246,7 +250,7 @@ onUnmounted(() => {
           v-if="env.dshHomeExists && !env.dshHomeWritable && env.dshHomeOwner !== env.currentUid"
           class="note warn"
         >
-          修复权限:<code>sudo chown -R $(whoami) ~/.dsh</code>
+          修复权限:<code>sudo chown -R $(whoami) "{{ env.dshHome }}"</code>
         </div>
 
         <h2>已探测的目录(仅列出含 dsh 或 node 的)</h2>

@@ -116,6 +116,11 @@ dsh web: http://127.0.0.1:3899/?token=BNHjr4KcVzcYGtmEyrM1OG0_ydKK6y83nDT826LTBK
 
 ## 6. profile 与插件机制
 
+> **目录归属决策(2026-09-15)**:DHDesktop 使用**完全独立**的数据目录,
+> 不读也不写用户机器上共享的 `~/.dsh`。传给子进程的 `DSH_HOME` 是
+> `~/Library/Application Support/com.dhdesktop.app/dsh-home`(可用 `DHDESKTOP_DSH_HOME` 覆盖)。
+> 下文涉及的 `$DSH_HOME` 均指这个独立目录。
+
 `$DSH_HOME` 默认 `~/.dsh`,可用环境变量覆盖(`@deepseek-ai/dsh-home-paths`)。目录结构:
 
 ```
@@ -188,7 +193,7 @@ $DSH_HOME/
 | `@deepseek-ai/dsh-desktop-host` 未发布(404) | 拿不到官方管道传输层,只能用公开 CLI |
 | `npx @deepseek-ai/dsh` 首次下载 **约 292MB**(`~/.npm/_npx` 总计 808MB,实测) | **不能把 npx 作为默认路径**;必须内置运行时或明确的首次下载引导 |
 | 官方标注 **developer preview,会有不兼容改动** | 协议与配置格式需要版本适配层 / 钉版本 |
-| 本机 `~/.dsh` **整个目录属于 root**(`settings.yaml` 为 `600 root`) | 普通用户 `chen` 无法写入 → `dsh web` 报 `EACCES ... profiles/web/package.json`。**客户端必须检测并给出修复引导**,否则任何 dsh 使用都会失败 |
+| 本机 `~/.dsh` **整个目录属于 root**(`settings.yaml` / `.credentials.yaml` 均为 root 所有) | 普通用户无法写入 → dsh 报 `EACCES`。**DHDesktop 通过使用独立数据目录规避了这个问题**(见第 6 节),因此不影响客户端 |
 | `dsh` 是**三层进程树**(`npx` → `npm exec` → `node .../.bin/dsh`) | 只杀直接子进程会把真正的服务留下变孤儿(实测)。必须 `setpgid` 自成进程组 + 按组发信号 |
 | 应用被强杀时,退出钩子不执行 | 子进程组会残留并占端口 → 需要 pidfile + 下次启动前的残留清理 |
 | Finder 启动的 GUI 应用只拿到 `/usr/bin:/bin:/usr/sbin:/sbin` | `dsh`/`npx` 都是 `#!/usr/bin/env node`,子进程会因找不到 `node` 而死 → 必须补全 `PATH` |
