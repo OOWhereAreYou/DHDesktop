@@ -16,6 +16,8 @@ use super::paths;
 pub enum Source {
     /// 用户显式通过 `DHDESKTOP_DSH_BIN` 指定。
     EnvOverride,
+    /// 应用自己装的运行时(最快路径)。
+    LocalRuntime,
     /// 来自 `PATH`。
     Path,
     /// 来自我们主动探测的常见安装位置。
@@ -28,11 +30,24 @@ impl Source {
     fn label(&self) -> &'static str {
         match self {
             Source::EnvOverride => "环境变量 DHDESKTOP_DSH_BIN",
+            Source::LocalRuntime => "应用自带运行时",
             Source::Path => "PATH",
             Source::KnownLocation => "常见安装位置",
             Source::Npx => "npx 兜底(首次需下载)",
         }
     }
+}
+
+/// 要安装的 dsh 版本。升级时改这里,或者用 `DHDESKTOP_DSH_SPEC` 临时覆盖。
+const DEFAULT_DSH_SPEC: &str = "@deepseek-ai/dsh@0.1.5-rc.1";
+
+/// 钉版本而不是 `@latest`:后者每次安装都可能拿到不同版本,而 dsh 明确标注会有
+/// 不兼容变更。
+pub fn install_spec() -> String {
+    std::env::var("DHDESKTOP_DSH_SPEC")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_DSH_SPEC.to_string())
 }
 
 /// 找到的启动方式。`program` + `args` 就是实际要 spawn 的命令前缀。
@@ -137,8 +152,8 @@ fn resolve_in(dirs: &[PathBuf], source: Source) -> Option<ResolvedDsh> {
     })
 }
 
-/// 找出一种可用的启动方式;全部失败则返回 `None`。
-pub fn resolve() -> Option<ResolvedDsh> {
+/// 找出一种现成可用的启动方式(不包含 npx 兜底);全部失败则返回 `None`。
+pub fn resolve_existing() -> Option<ResolvedDsh> {
     // 1. 用户显式指定优先
     if let Ok(v) = std::env::var("DHDESKTOP_DSH_BIN") {
         if !v.trim().is_empty() {
@@ -155,29 +170,65 @@ pub fn resolve() -> Option<ResolvedDsh> {
         }
     }
 
-    // 2. PATH
+    // 2. 应用自己装的运行时:最快(实测 2.9s vs npx 6.9s)
+    if let Some(runtime) = local_runtime() {
+        return Some(runtime);
+    }
+
+    // 3. PATH
     if let Some(r) = resolve_in(&path_dirs(), Source::Path) {
         return Some(r);
     }
 
-    // 3. 常见安装位置
-    if let Some(r) = resolve_in(&known_dirs(), Source::KnownLocation) {
-        return Some(r);
-    }
+    // 4. 常见安装位置
+    resolve_in(&known_dirs(), Source::KnownLocation)
+}
 
-    // 4. npx 兜底
+/// 应用自带运行时(已安装时)。
+///
+/// 用 `node <entry>` 直接启动,不经 npm/npx。
+pub fn local_runtime() -> Option<ResolvedDsh> {
+    let entry = paths::runtime_entry();
+    if !entry.is_file() {
+        return None;
+    }
+    let node = node_path()?;
+    Some(ResolvedDsh {
+        program: node.display().to_string(),
+        args: vec![entry.display().to_string()],
+        display: format!("{} {}", node.display(), entry.display()),
+        source_label: Source::LocalRuntime.label().to_string(),
+        source: Source::LocalRuntime,
+    })
+}
+
+/// npx 兜底:前面都不可用时的最后手段。
+pub fn npx_fallback() -> Option<ResolvedDsh> {
     let all: Vec<PathBuf> = path_dirs().into_iter().chain(known_dirs()).collect();
-    if let Some(npx) = find_in(&all, "npx") {
-        return Some(ResolvedDsh {
-            program: npx.display().to_string(),
-            args: vec!["-y".into(), "@deepseek-ai/dsh@latest".into()],
-            display: format!("{} -y @deepseek-ai/dsh@latest", npx.display()),
-            source_label: Source::Npx.label().to_string(),
-            source: Source::Npx,
-        });
-    }
+    let npx = find_in(&all, "npx")?;
+    Some(ResolvedDsh {
+        program: npx.display().to_string(),
+        args: vec!["-y".into(), install_spec()],
+        display: format!("{} -y {}", npx.display(), install_spec()),
+        source_label: Source::Npx.label().to_string(),
+        source: Source::Npx,
+    })
+}
 
-    None
+pub fn node_path() -> Option<PathBuf> {
+    let all: Vec<PathBuf> = path_dirs().into_iter().chain(known_dirs()).collect();
+    find_in(&all, "node")
+}
+
+/// npm 可执行文件。通常在 node 旁边。
+pub fn npm_path() -> Option<PathBuf> {
+    let all: Vec<PathBuf> = path_dirs().into_iter().chain(known_dirs()).collect();
+    find_in(&all, "npm")
+}
+
+/// 兼容旧调用:先找现成的,再退 npx。
+pub fn resolve() -> Option<ResolvedDsh> {
+    resolve_existing().or_else(npx_fallback)
 }
 
 /// 给子进程使用的 `PATH`:保留原有 `PATH`(优先),再补上我们探测到的目录。

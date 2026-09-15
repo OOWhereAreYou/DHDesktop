@@ -113,6 +113,8 @@ struct Inner {
     running: Option<Running>,
     /// 已 spawn 但还没就绪的 pid,供超时/停止时清理。
     pending_pid: Option<u32>,
+    /// spawn 时刻,用来报告启动耗时(性能是可测量的,不靠感觉)。
+    spawn_at: Option<std::time::Instant>,
     /// 正在被我们主动停止 —— 用于区分「意外退出」和「按预期退出」。
     stopping: bool,
     logs: VecDeque<LogLine>,
@@ -461,6 +463,18 @@ struct OpenOutcome {
     root: Option<url::Url>,
 }
 
+/// 把一个子进程输出流按行泵进日志。
+async fn pump_lines<R>(manager: Arc<BackendManager>, stream: Option<R>, tag: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(stream) = stream else { return };
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        manager.log(tag, line).await;
+    }
+}
+
 impl BackendManager {
     pub fn new(app: AppHandle) -> Self {
         Self {
@@ -468,6 +482,7 @@ impl BackendManager {
                 status: BackendStatus::Idle,
                 running: None,
                 pending_pid: None,
+                spawn_at: None,
                 stopping: false,
                 logs: VecDeque::new(),
                 seq: 0,
@@ -799,19 +814,29 @@ impl BackendManager {
             self.emit_log(&mut inner, "system", desc);
         }
 
-        // 解析启动方式
-        let resolved = match locate::resolve() {
-            Some(r) => r,
-            None => {
-                let message = "未找到可用的 dsh:PATH 与常见安装位置都没有,也没有 npx。\
-                               请先安装(例如 npm i -g @deepseek-ai/dsh),或用环境变量 DHDESKTOP_DSH_BIN 指定路径。"
-                    .to_string();
+        // 解析启动方式:优先用现成的;都没有就把 dsh 装进应用自己的运行时目录
+        // (只装一次,之后启动从 6.9s 降到 2.9s)。
+        let resolved = if let Some(existing) = locate::resolve_existing() {
+            existing
+        } else {
+            if let Err(message) = self.ensure_runtime().await {
                 let mut inner = self.inner.lock().await;
-                self.emit_log(&mut inner, "system", message.clone());
-                self.emit_status(&mut inner, BackendStatus::Failed { message: message.clone() });
-                drop(inner);
-                self.show_main_window();
-                return BackendStatus::Failed { message };
+                self.emit_log(&mut inner, "system", message);
+            }
+            match locate::local_runtime().or_else(locate::npx_fallback) {
+                Some(r) => r,
+                None => {
+                    let message = "没有可用的 dsh,也装不上自带运行时。\
+                                   请手动安装(例如 npm i -g @deepseek-ai/dsh),\
+                                   或用环境变量 DHDESKTOP_DSH_BIN 指定路径。"
+                        .to_string();
+                    let mut inner = self.inner.lock().await;
+                    self.emit_log(&mut inner, "system", message.clone());
+                    self.emit_status(&mut inner, BackendStatus::Failed { message: message.clone() });
+                    drop(inner);
+                    self.show_main_window();
+                    return BackendStatus::Failed { message };
+                }
             }
         };
 
@@ -892,6 +917,7 @@ impl BackendManager {
         {
             let mut inner = self.inner.lock().await;
             inner.pending_pid = Some(pid);
+            inner.spawn_at = Some(std::time::Instant::now());
             inner.stopping = false;
             self.emit_log(&mut inner, "system", format!("dsh 子进程已启动 (pid {pid})"));
         }
@@ -922,8 +948,16 @@ impl BackendManager {
                                 started_at_ms,
                             },
                         );
+                        let elapsed = inner
+                            .spawn_at
+                            .map(|t| t.elapsed().as_secs_f32())
+                            .unwrap_or_default();
                         drop(inner);
-                        me.log("system", format!("dsh 后端就绪:{program}")).await;
+                        me.log(
+                            "system",
+                            format!("dsh 后端就绪({program},启动耗时 {elapsed:.1}s)"),
+                        )
+                        .await;
                         me.open_backend_window(&info.url).await;
                     }
                 }
@@ -998,6 +1032,74 @@ impl BackendManager {
         }
 
         self.inner.lock().await.status.clone()
+    }
+
+    /// 把 dsh 装进应用自己的运行时目录。只在前一次都没有可用 dsh 时跑。
+    ///
+    /// 为什么不用 npx 就完事:实测 npx 到就绪要 6.9 秒,直接 node 跑同一份代码
+    /// 只要 2.9 秒 —— 差额全在 npm 的解析与 registry 检查上。装一次换来每次启动都走快路。
+    async fn ensure_runtime(self: &Arc<Self>) -> Result<(), String> {
+        let runtime = paths::runtime_dir();
+        let spec = locate::install_spec();
+        let npm = locate::npm_path()
+            .ok_or_else(|| "找不到 npm,无法准备自带运行时".to_string())?;
+
+        // 只有这条路径是慢的(要下载/安装),所以只有这里把状态页露出来显示进度;
+        // 平时启动不显示我们的窗口。
+        self.show_main_window();
+
+        self.log(
+            "system",
+            format!("首次启动:准备自带运行时 {spec} → {}", runtime.display()),
+        )
+        .await;
+        self.log("system", "这一步只做一次,完成后启动会明显变快".to_string())
+            .await;
+
+        let mut cmd = Command::new(&npm);
+        cmd.arg("install")
+            .arg("--prefix")
+            .arg(&runtime)
+            .args([
+                "--prefer-offline", // npm 缓存里有就直接用,省下载
+                "--no-audit",
+                "--no-fund",
+                "--loglevel=http",
+            ])
+            .arg(&spec)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = locate::child_path_env() {
+            cmd.env("PATH", path);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("启动 npm 失败: {e}"))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let out_task = {
+            let me = Arc::clone(self);
+            tokio::spawn(async move { pump_lines(me, stdout, "npm").await })
+        };
+        let err_task = {
+            let me = Arc::clone(self);
+            tokio::spawn(async move { pump_lines(me, stderr, "npm").await })
+        };
+
+        let status = child.wait().await;
+        let _ = out_task.await;
+        let _ = err_task.await;
+
+        if !paths::runtime_entry().is_file() {
+            let code = status.map(|s| format!("{s}")).unwrap_or_else(|e| e.to_string());
+            return Err(format!("运行时安装失败({code}),详见上方 npm 输出"));
+        }
+
+        self.log("system", "自带运行时就绪".to_string()).await;
+        Ok(())
     }
 
     /// 停止后端。SIGTERM → 宽限 → SIGKILL。

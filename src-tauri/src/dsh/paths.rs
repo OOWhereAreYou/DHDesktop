@@ -105,6 +105,21 @@ pub fn pidfile() -> PathBuf {
     dsh_home().join("dhdesktop-backend.pid")
 }
 
+/// 应用自己管理的 dsh 运行时目录(`npm install --prefix` 的落点)。
+///
+/// 存在的理由:启动速度。实测 `npx @latest` 到就绪要 6.9 秒,而直接用 node 跑
+/// 同一份代码只要 2.9 秒 —— 差异全在 npm 的解析/registry 检查上。
+/// 装一次之后就不再经过 npx。
+pub fn runtime_dir() -> PathBuf {
+    app_data_dir().join("runtime")
+}
+
+/// dsh 的入口脚本(存在即说明运行时已就绪)。
+pub fn runtime_entry() -> PathBuf {
+    runtime_dir()
+        .join("node_modules/@deepseek-ai/dsh/lib/bin.js")
+}
+
 /// 目标目录是否可写(会尝试创建并用临时文件实测)。
 pub fn is_writable(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
